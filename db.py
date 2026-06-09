@@ -46,6 +46,18 @@ async def init_db() -> None:
                 paid_at     TEXT
             )"""
         )
+        await conn.execute(
+            """CREATE TABLE IF NOT EXISTS referrals (
+                tg_id        BIGINT PRIMARY KEY,
+                username     TEXT,
+                agency_nick  TEXT,
+                stage        TEXT DEFAULT 'started',  -- started | wrote | webinar | working | completed
+                shifts       INTEGER DEFAULT 0,
+                paid_out     BOOLEAN DEFAULT FALSE,    -- забрал ли ты свои $50
+                created_at   TEXT,
+                updated_at   TEXT
+            )"""
+        )
 
 
 async def close() -> None:
@@ -145,3 +157,71 @@ async def stats() -> dict:
         "revenue": revenue,
         "by_source": [(r["s"], r["c"]) for r in by_source],
     }
+
+
+# ---------------- рефералы (агентство) ----------------
+
+async def start_referral(tg_id: int, username) -> dict:
+    """Создаёт запись реферала при первом входе в воронку агентства."""
+    async with _pool.acquire() as conn:
+        await conn.execute(
+            """INSERT INTO referrals (tg_id, username, stage, created_at, updated_at)
+               VALUES ($1, $2, 'started', $3, $3)
+               ON CONFLICT (tg_id) DO UPDATE SET username = EXCLUDED.username""",
+            tg_id, username, _now(),
+        )
+        row = await conn.fetchrow("SELECT * FROM referrals WHERE tg_id = $1", tg_id)
+    return dict(row)
+
+
+async def get_referral(tg_id: int):
+    async with _pool.acquire() as conn:
+        row = await conn.fetchrow("SELECT * FROM referrals WHERE tg_id = $1", tg_id)
+    return dict(row) if row else None
+
+
+async def set_referral_stage(tg_id: int, stage: str) -> None:
+    async with _pool.acquire() as conn:
+        await conn.execute(
+            "UPDATE referrals SET stage = $1, updated_at = $2 WHERE tg_id = $3",
+            stage, _now(), tg_id)
+
+
+async def set_referral_nick(tg_id: int, nick: str) -> None:
+    async with _pool.acquire() as conn:
+        await conn.execute(
+            "UPDATE referrals SET agency_nick = $1, stage = 'webinar', updated_at = $2 WHERE tg_id = $3",
+            nick, _now(), tg_id)
+
+
+async def inc_referral_shift(tg_id: int) -> int:
+    """Увеличивает счётчик смен, возвращает новое значение. На 5-й помечает completed."""
+    async with _pool.acquire() as conn:
+        shifts = await conn.fetchval(
+            """UPDATE referrals
+               SET shifts = shifts + 1,
+                   stage = CASE WHEN shifts + 1 >= 5 THEN 'completed' ELSE 'working' END,
+                   updated_at = $2
+               WHERE tg_id = $1 RETURNING shifts""",
+            tg_id, _now())
+    return shifts
+
+
+async def mark_referral_paidout(tg_id: int) -> None:
+    async with _pool.acquire() as conn:
+        await conn.execute("UPDATE referrals SET paid_out = TRUE, updated_at = $1 WHERE tg_id = $2",
+                           _now(), tg_id)
+
+
+async def referral_list():
+    async with _pool.acquire() as conn:
+        rows = await conn.fetch("SELECT * FROM referrals ORDER BY updated_at DESC")
+    return [dict(r) for r in rows]
+
+
+async def referral_stats() -> dict:
+    async with _pool.acquire() as conn:
+        total = await conn.fetchval("SELECT COUNT(*) FROM referrals")
+        completed = await conn.fetchval("SELECT COUNT(*) FROM referrals WHERE shifts >= 5")
+        paid_out = await conn.fetchval("SELECT COUNT(*) FROM referrals WHERE paid_out = TRUE")
+    return {"total": total, "completed": completed, "paid_out": paid_out}

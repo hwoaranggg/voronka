@@ -28,6 +28,11 @@ class Config:
     cryptobot_token: str = os.getenv("CRYPTOBOT_TOKEN", "")
     crypto_fiat: str = os.getenv("CRYPTO_FIAT", "RUB")       # инвойс в рублях, плательщик сам выбирает монету
 
+    # --- агентство / рефералы ---
+    agency_contact: str = os.getenv("AGENCY_CONTACT", "@sexter")        # кому писать в агентство
+    referral_from: str = os.getenv("REFERRAL_FROM", "@frombritannia")   # от кого (твой реф-хэндл)
+    curator_username: str = os.getenv("CURATOR_USERNAME", "@frombritannia")  # твой личный контакт для кураторства
+
     # --- база данных ---
     # Railway сам подставит DATABASE_URL при добавлении плагина PostgreSQL.
     database_url: str = os.getenv("DATABASE_URL", "")
