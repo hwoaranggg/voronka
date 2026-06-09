@@ -28,8 +28,11 @@ class Config:
     cryptobot_token: str = os.getenv("CRYPTOBOT_TOKEN", "")
     crypto_fiat: str = os.getenv("CRYPTO_FIAT", "RUB")       # инвойс в рублях, плательщик сам выбирает монету
 
+    # --- база данных ---
+    # Railway сам подставит DATABASE_URL при добавлении плагина PostgreSQL.
+    database_url: str = os.getenv("DATABASE_URL", "")
+
     # --- прочее ---
-    db_path: str = os.getenv("DB_PATH", "bot.db")
     poll_interval: int = int(os.getenv("POLL_INTERVAL", "30"))  # фоновая проверка оплат, сек
     invite_expire_hours: int = int(os.getenv("INVITE_EXPIRE_HOURS", "24"))
 

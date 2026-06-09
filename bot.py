@@ -306,6 +306,7 @@ async def main() -> None:
         await dp.start_polling(bot)
     finally:
         await http.close()
+        await db.close()
         await bot.session.close()
 
 
