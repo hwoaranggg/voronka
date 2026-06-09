@@ -34,7 +34,19 @@ class Broadcast(StatesGroup):
     waiting_message = State()
 
 
+class AgencyFlow(StatesGroup):
+    waiting_nick = State()
+
+
 # ---------------- утилиты ----------------
+
+async def notify_admins(text: str) -> None:
+    for admin in config.admin_ids:
+        try:
+            await bot.send_message(admin, text)
+        except Exception:  # noqa: BLE001
+            pass
+
 
 def is_admin(tg_id: int) -> bool:
     return tg_id in config.admin_ids
@@ -81,6 +93,82 @@ async def grant_access(tg_id: int) -> None:
             await bot.send_message(admin, f"💰 Новая оплата! Пользователь <code>{tg_id}</code>")
         except Exception:  # noqa: BLE001
             pass
+
+
+# ---------------- воронка агентства / рефералы ----------------
+
+@router.message(Command("agency"))
+async def cmd_agency(message: Message) -> None:
+    kb = InlineKeyboardBuilder()
+    kb.button(text=texts.AGENCY_WANT_BTN, callback_data="ag:want")
+    await message.answer(texts.agency_pitch(), reply_markup=kb.as_markup())
+
+
+@router.callback_query(F.data == "ag:want")
+async def agency_want(call: CallbackQuery) -> None:
+    await db.start_referral(call.from_user.id, call.from_user.username)
+    kb = InlineKeyboardBuilder()
+    kb.button(text=texts.AGENCY_WROTE_BTN, callback_data="ag:wrote")
+    await call.message.edit_reply_markup(reply_markup=None)
+    await call.message.answer(texts.agency_instruction(), reply_markup=kb.as_markup())
+    await call.answer()
+
+
+@router.callback_query(F.data == "ag:wrote")
+async def agency_wrote(call: CallbackQuery) -> None:
+    await db.set_referral_stage(call.from_user.id, "wrote")
+    kb = InlineKeyboardBuilder()
+    kb.button(text=texts.AGENCY_WEBINAR_BTN, callback_data="ag:webinar")
+    await call.message.edit_reply_markup(reply_markup=None)
+    await call.message.answer(texts.AGENCY_AFTER_WROTE, reply_markup=kb.as_markup())
+    uname = f"@{call.from_user.username}" if call.from_user.username else call.from_user.id
+    await notify_admins(f"📝 Реферал {uname} написал в агентство (ожидает вебинар)")
+    await call.answer()
+
+
+@router.callback_query(F.data == "ag:webinar")
+async def agency_webinar(call: CallbackQuery, state: FSMContext) -> None:
+    await call.message.edit_reply_markup(reply_markup=None)
+    await state.set_state(AgencyFlow.waiting_nick)
+    await call.message.answer(texts.AGENCY_ASK_NICK)
+    await call.answer()
+
+
+@router.message(AgencyFlow.waiting_nick)
+async def agency_nick(message: Message, state: FSMContext) -> None:
+    await state.clear()
+    nick = message.text.strip()
+    await db.set_referral_nick(message.from_user.id, nick)
+    # выдаём счётчик смен
+    kb = InlineKeyboardBuilder()
+    kb.button(text=texts.agency_shift_btn(0), callback_data="ag:shift")
+    await message.answer(texts.agency_curator(config.curator_username),
+                         reply_markup=kb.as_markup())
+    uname = f"@{message.from_user.username}" if message.from_user.username else message.from_user.id
+    await notify_admins(
+        f"🎓 Реферал {uname} прошёл вебинар!\n"
+        f"Ник в агентстве: <b>{nick}</b>\nПроверь, что он реально от тебя.")
+
+
+@router.callback_query(F.data == "ag:shift")
+async def agency_shift(call: CallbackQuery) -> None:
+    ref = await db.get_referral(call.from_user.id)
+    if ref and ref["shifts"] >= 5:
+        await call.answer("Стажировка уже пройдена 🎉")
+        return
+    shifts = await db.inc_referral_shift(call.from_user.id)
+    uname = f"@{call.from_user.username}" if call.from_user.username else call.from_user.id
+    await notify_admins(f"📅 Реферал {uname} завершил смену {shifts}/5")
+
+    if shifts >= 5:
+        await call.message.edit_reply_markup(reply_markup=None)
+        await call.message.answer(texts.AGENCY_DONE)
+        await notify_admins(f"💰 {uname} прошёл 5 смен — время забрать свои $50!")
+    else:
+        kb = InlineKeyboardBuilder()
+        kb.button(text=texts.agency_shift_btn(shifts), callback_data="ag:shift")
+        await call.message.edit_reply_markup(reply_markup=kb.as_markup())
+    await call.answer(f"Смена {shifts}/5 засчитана ✅")
 
 
 # ---------------- старт + квиз ----------------
@@ -208,6 +296,7 @@ async def admin(message: Message) -> None:
         return
     kb = InlineKeyboardBuilder()
     kb.button(text="📊 Статистика", callback_data="adm:stats")
+    kb.button(text="👥 Рефералы", callback_data="adm:refs")
     kb.button(text="📣 Рассылка", callback_data="adm:broadcast")
     kb.adjust(1)
     await message.answer("Админ-панель:", reply_markup=kb.as_markup())
@@ -230,6 +319,60 @@ async def admin_stats(call: CallbackQuery) -> None:
     )
     await call.message.answer(text)
     await call.answer()
+
+
+@router.callback_query(F.data == "adm:refs")
+async def admin_refs(call: CallbackQuery) -> None:
+    if not is_admin(call.from_user.id):
+        await call.answer()
+        return
+    rs = await db.referral_stats()
+    refs = await db.referral_list()
+
+    stage_names = {
+        "started": "начал", "wrote": "написал в агентство",
+        "webinar": "прошёл вебинар", "working": "на стажировке",
+        "completed": "5 смен ✅",
+    }
+    lines = []
+    for r in refs[:30]:
+        uname = f"@{r['username']}" if r["username"] else r["tg_id"]
+        nick = f" / {r['agency_nick']}" if r["agency_nick"] else ""
+        stage = stage_names.get(r["stage"], r["stage"])
+        paid = " 💵забрано" if r["paid_out"] else ""
+        lines.append(f"• {uname}{nick} — {stage} ({r['shifts']}/5){paid}")
+    body = "\n".join(lines) or "Пока нет рефералов."
+
+    potential = (rs["completed"] - rs["paid_out"]) * 50
+    text = (
+        "👥 <b>Рефералы</b>\n\n"
+        f"Всего: <b>{rs['total']}</b>\n"
+        f"Прошли 5 смен: <b>{rs['completed']}</b>\n"
+        f"Выплат забрано: <b>{rs['paid_out']}</b>\n"
+        f"К получению: <b>${potential}</b>\n\n"
+        f"{body}"
+    )
+    kb = InlineKeyboardBuilder()
+    has_btn = False
+    for r in refs:
+        if r["shifts"] >= 5 and not r["paid_out"]:
+            label = r["agency_nick"] or (f"@{r['username']}" if r["username"] else str(r["tg_id"]))
+            kb.button(text=f"💵 Забрал $50: {label}", callback_data=f"adm:payout:{r['tg_id']}")
+            has_btn = True
+    kb.adjust(1)
+    await call.message.answer(text, reply_markup=kb.as_markup() if has_btn else None)
+    await call.answer()
+
+
+@router.callback_query(F.data.startswith("adm:payout:"))
+async def admin_payout(call: CallbackQuery) -> None:
+    if not is_admin(call.from_user.id):
+        await call.answer()
+        return
+    tg_id = int(call.data.rsplit(":", 1)[1])
+    await db.mark_referral_paidout(tg_id)
+    await call.answer("Отмечено как выплаченное 💵", show_alert=True)
+    await call.message.edit_reply_markup(reply_markup=None)
 
 
 @router.callback_query(F.data == "adm:broadcast")
